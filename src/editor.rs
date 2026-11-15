@@ -304,7 +304,7 @@ pub fn create(params: Arc<CvParams>, reduction: Arc<AtomicF32>) -> Option<Box<dy
                     }
                 });
                 if plate_button(ui, rr(242.0, 76.0, 300.0, 98.0), t("СОХР.", "SAVE")) {
-                    st.naming = Some(crate::native::ask_text(t("Название пресета:", "Preset name:")));
+                    st.naming = Some(crate::native::ask_text(t("Название пресета:", "Preset name:"), t("Сохранить", "Save"), t("Отмена", "Cancel")));
                 }
                 if let Some(i) = st.store.presets.iter().position(|p| p.name == current) {
                     if plate_button(ui, rr(306.0, 76.0, 364.0, 98.0), t("УДАЛ.", "DELETE")) {
