@@ -18,5 +18,7 @@ if ($LASTEXITCODE) { throw 'Installer build failed' }
 
 git tag "v$ver"
 git push origin HEAD "v$ver"
-gh release create "v$ver" "dist\CleanVoice-$ver-setup.exe" --title "Clean Voice $ver" --generate-notes
+# Copy with a fixed name: the Yaytsa Cloud site links to .../releases/latest/download/CleanVoice-Setup.exe
+Copy-Item "dist\CleanVoice-$ver-setup.exe" "dist\CleanVoice-Setup.exe" -Force
+gh release create "v$ver" "dist\CleanVoice-$ver-setup.exe" "dist\CleanVoice-Setup.exe" --title "Clean Voice $ver" --generate-notes
 Write-Host "Released v$ver"
