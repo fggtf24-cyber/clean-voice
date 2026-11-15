@@ -1,0 +1,39 @@
+[workspace]
+members = ["xtask"]
+exclude = ["vendor"]
+
+[package]
+name = "clean_voice"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "DeepFilterNet3 voice denoiser (VST3/CLAP)"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet.git", rev = "7b14b895fe7fc42cab72b4a4c1e49c982bd6404b", default-features = false, features = ["tract", "default-model"] }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+realfft = "3"
+rubato = "0.14"
+ndarray = "0.15"
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 2
+
+[features]
+standalone = ["nih_plug/standalone"]
+
+[[bin]]
+name = "standalone"
+required-features = ["standalone"]
