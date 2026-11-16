@@ -68,6 +68,11 @@ impl Delay {
 
 const HUM_HARMONICS: usize = 24;
 const HUM_BW_HZ: f64 = 3.0;
+/// Notch width right after a reset (seek / play start) and how often it is narrowed (samples).
+const HUM_BW_FAST: f64 = 20.0;
+const HUM_BW_STEP: usize = 32;
+/// After silence or a reset, band powers are ignored for sr / HUM_SETTLE_DIV samples.
+const HUM_SETTLE_DIV: usize = 10;
 
 /// Detection: band powers are averaged over blocks of 25 ms; the floor of each band is the
 /// minimum over the last HUM_HIST blocks (5 s), i.e. what remains at the quietest moment of
@@ -76,10 +81,16 @@ const HUM_HIST: usize = 200;
 /// Hum-to-neighbour ratio (dB) where a notch starts to engage / is fully engaged.
 const HUM_ON_DB: f32 = 6.0;
 const HUM_FULL_DB: f32 = 12.0;
+/// Short window (blocks, 1 s) for fast reaction to new / louder hum, with thresholds raised
+/// by this much since one second may hold no speech pause.
+const HUM_SHORT: usize = 40;
+const HUM_SHORT_EXTRA_DB: f32 = 3.0;
 /// Absolute hum level per harmonic (dBFS, RMS) where a notch may start / fully engage.
 /// Fainter hum is inaudible, and the notch's ringing would be louder than the hum itself.
 const HUM_MIN_DBFS: f32 = -75.0;
 const HUM_LOUD_DBFS: f32 = -65.0;
+/// Blocks quieter than -80 dBFS (mean power per frame) are ignored by the detector.
+const HUM_QUIET_POW: f64 = 1e-8;
 
 /// Adaptive mains hum remover. A fixed comb of 24 notches rings audibly on clean voice
 /// (decaying copies every 1/f0 = 20 ms), so each notch is applied only as far as hum is
@@ -98,6 +109,9 @@ struct Hum {
     zr: [[[f64; 2]; HUM_HARMONICS + 1]; 2],
     acc_h: [f64; HUM_HARMONICS],
     acc_r: [f64; HUM_HARMONICS + 1],
+    acc_in: f64,
+    /// Samples left before band powers are trusted again (3 Hz bands need ~0.25 s to settle).
+    settle: usize,
     hist_h: [[f32; HUM_HIST]; HUM_HARMONICS],
     hist_r: [[f32; HUM_HIST]; HUM_HARMONICS + 1],
     hpos: usize,
@@ -107,12 +121,21 @@ struct Hum {
     target: [f32; HUM_HARMONICS],
     g: [f32; HUM_HARMONICS],
     smooth: f32,
+    smooth_on: f32,
+    /// Current width of the removal bandpasses: wide right after a reset so the notches lock
+    /// onto the hum within ~20 ms instead of ~0.3 s, then narrowing back to HUM_BW_HZ.
+    bw: f64,
+    bw_decay: f64,
 }
 
 /// RBJ constant-0-dB-peak bandpass, 3 Hz wide: [b0 (= -b2), a1, a2]; b1 = 0.
 fn hum_bp(sr: f64, f: f64) -> [f64; 3] {
+    hum_bp_bw(sr, f, HUM_BW_HZ)
+}
+
+fn hum_bp_bw(sr: f64, f: f64, bw: f64) -> [f64; 3] {
     let w = 2.0 * std::f64::consts::PI * f / sr;
-    let alpha = w.sin() / (2.0 * (f / HUM_BW_HZ));
+    let alpha = w.sin() / (2.0 * (f / bw));
     let a0 = 1.0 + alpha;
     [alpha / a0, -2.0 * w.cos() / a0, (1.0 - alpha) / a0]
 }
@@ -137,6 +160,8 @@ impl Hum {
             zr: [[[0.0; 2]; HUM_HARMONICS + 1]; 2],
             acc_h: [0.0; HUM_HARMONICS],
             acc_r: [0.0; HUM_HARMONICS + 1],
+            acc_in: 0.0,
+            settle: 0,
             hist_h: [[0.0; HUM_HIST]; HUM_HARMONICS],
             hist_r: [[0.0; HUM_HIST]; HUM_HARMONICS + 1],
             hpos: 0,
@@ -147,6 +172,9 @@ impl Hum {
             g: [0.0; HUM_HARMONICS],
             // ~0.2 s glide so notches fade in/out without clicks.
             smooth: (-1.0 / (0.2 * sr as f64)).exp() as f32,
+            smooth_on: (-1.0 / (0.05 * sr as f64)).exp() as f32,
+            bw: HUM_BW_HZ,
+            bw_decay: (-(HUM_BW_STEP as f64) / (0.15 * sr as f64)).exp(),
         }
     }
     /// `f0` = 50 or 60 Hz, 0 = off. Alloc-free.
@@ -173,6 +201,7 @@ impl Hum {
         self.hist_r = [[0.0; HUM_HIST]; HUM_HARMONICS + 1];
         self.acc_h = [0.0; HUM_HARMONICS];
         self.acc_r = [0.0; HUM_HARMONICS + 1];
+        self.acc_in = 0.0;
         self.target = [0.0; HUM_HARMONICS];
         self.g = [0.0; HUM_HARMONICS];
         self.hpos = 0;
@@ -182,6 +211,9 @@ impl Hum {
     }
     /// Clears filter states only: the learned hum profile survives transport stop/seek.
     fn reset(&mut self) {
+        self.settle = self.sr as usize / HUM_SETTLE_DIV;
+        self.bw = HUM_BW_FAST;
+        self.update_bw();
         self.zh = [[[0.0; 2]; HUM_HARMONICS]; 2];
         self.zr = [[[0.0; 2]; HUM_HARMONICS + 1]; 2];
     }
@@ -191,10 +223,13 @@ impl Hum {
             return x;
         }
         let xd = x as f64;
+        self.acc_in += xd * xd;
         let mut y = xd;
         for i in 0..self.n {
             let b = bp_tick(&self.ch[i], &mut self.zh[ch][i], xd);
-            self.acc_h[i] += b * b;
+            // While the bands are wide (just after a reset) they collect bw/3 times more noise
+            // than the 3 Hz references: scale back so detection stays fair (tones read lower).
+            self.acc_h[i] += b * b * (HUM_BW_HZ / self.bw);
             y -= self.g[i] as f64 * b;
         }
         for j in 0..=self.n {
@@ -203,6 +238,11 @@ impl Hum {
         }
         y as f32
     }
+    fn update_bw(&mut self) {
+        for i in 0..self.n {
+            self.ch[i] = hum_bp_bw(self.sr, self.f0 as f64 * (i + 1) as f64, self.bw);
+        }
+    }
     /// Call once per sample frame, after `tick` for every channel.
     #[inline]
     fn end_frame(&mut self) {
@@ -210,13 +250,39 @@ impl Hum {
             return;
         }
         for i in 0..self.n {
-            self.g[i] = self.target[i] + self.smooth * (self.g[i] - self.target[i]);
+            // Engage fast (~50 ms) so hum is gone right after play starts, release slowly.
+            let k = if self.target[i] > self.g[i] { self.smooth_on } else { self.smooth };
+            self.g[i] = self.target[i] + k * (self.g[i] - self.target[i]);
         }
         self.count += 1;
+        if self.bw > HUM_BW_HZ && self.count % HUM_BW_STEP == 0 {
+            self.bw = HUM_BW_HZ + (self.bw - HUM_BW_HZ) * self.bw_decay;
+            if self.bw < HUM_BW_HZ + 0.01 {
+                self.bw = HUM_BW_HZ;
+            }
+            self.update_bw();
+        }
         if self.count < self.block {
             return;
         }
         self.count = 0;
+        // Silence (before the clip, gaps, pre-roll) says nothing about hum, and neither
+        // do the first 0.1 s after it or after a filter reset, while the 3 Hz bands ring up:
+        // such a block would pin the band floors and keep the notches off for 5 s.
+        // Near-silence counts too (fades on stop, dither, room tone at -90 dB): hum that faint is
+        // below HUM_MIN_DBFS anyway, but such a block would read as "no hum here" for 5 s.
+        let silent = self.acc_in < HUM_QUIET_POW * self.block as f64;
+        self.acc_in = 0.0;
+        if silent {
+            self.settle = self.sr as usize / HUM_SETTLE_DIV;
+        }
+        let settling = self.settle > 0;
+        self.settle = self.settle.saturating_sub(self.block);
+        if silent || settling {
+            self.acc_h = [0.0; HUM_HARMONICS];
+            self.acc_r = [0.0; HUM_HARMONICS + 1];
+            return;
+        }
         for i in 0..self.n {
             self.hist_h[i][self.hpos] = self.acc_h[i] as f32;
             self.acc_h[i] = 0.0;
@@ -228,16 +294,28 @@ impl Hum {
         self.hpos = (self.hpos + 1) % HUM_HIST;
         self.filled = (self.filled + 1).min(HUM_HIST);
         let k = self.filled;
+        let ks = k.min(HUM_SHORT);
+        let pos = self.hpos;
         let floor = |h: &[f32; HUM_HIST]| h[..k].iter().copied().fold(f32::INFINITY, f32::min);
-        for i in 0..self.n {
-            let hum = floor(&self.hist_h[i]);
-            // The louder neighbour: voice ringing in pauses can make one band read low by chance.
-            let refl = floor(&self.hist_r[i]).max(floor(&self.hist_r[i + 1]));
+        // The same over the last second only: catches hum that just appeared or got louder.
+        let floor_s = |h: &[f32; HUM_HIST]| (1..=ks).map(|j| h[(pos + HUM_HIST - j) % HUM_HIST]).fold(f32::INFINITY, f32::min);
+        let score = |hum: f32, refl: f32, on: f32, full: f32| {
             let db = 10.0 * ((hum + 1e-20) / (refl + 1e-20)).log10();
-            let by_ratio = (db - HUM_ON_DB) / (HUM_FULL_DB - HUM_ON_DB);
+            let by_ratio = (db - on) / (full - on);
             let lvl = 10.0 * (hum / self.block as f32 + 1e-20).log10();
             let by_level = (lvl - HUM_MIN_DBFS) / (HUM_LOUD_DBFS - HUM_MIN_DBFS);
-            self.target[i] = by_ratio.min(by_level).clamp(0.0, 1.0);
+            by_ratio.min(by_level).clamp(0.0, 1.0)
+        };
+        for i in 0..self.n {
+            // The louder neighbour: voice ringing in pauses can make one band read low by chance.
+            let long = score(floor(&self.hist_h[i]), floor(&self.hist_r[i]).max(floor(&self.hist_r[i + 1])), HUM_ON_DB, HUM_FULL_DB);
+            let short = score(
+                floor_s(&self.hist_h[i]),
+                floor_s(&self.hist_r[i]).max(floor_s(&self.hist_r[i + 1])),
+                HUM_ON_DB + HUM_SHORT_EXTRA_DB,
+                HUM_FULL_DB + HUM_SHORT_EXTRA_DB,
+            );
+            self.target[i] = long.max(short);
         }
     }
 }
@@ -556,6 +634,111 @@ mod tests {
         assert!(red > 20.0, "hum reduced only {red:.1} dB");
     }
 
+    #[test]
+    fn hum_after_digital_silence_removed_fast() {
+        let hm = hum(SR * 4);
+        let mut x = vec![0.0f32; SR * 2];
+        x.extend(&hm);
+        let y = run(&x);
+        let from = SR * 3; // 1 s after the hum starts
+        let left: f64 = y[from..].iter().map(|a| (*a as f64).powi(2)).sum();
+        let had: f64 = x[from..].iter().map(|a| (*a as f64).powi(2)).sum();
+        let red = db(had) - db(left);
+        println!("hum after silence reduced by {red:.1} dB");
+        assert!(red > 20.0, "hum after silence reduced only {red:.1} dB");
+    }
+
+    #[test]
+    fn hum_removed_right_after_seek() {
+        // Learn the hum, then "seek": reset() and continue at another mains phase.
+        let mut h = Hum::new(SR);
+        h.set(50.0);
+        for &s in &hum(SR * 6) {
+            h.tick(0, s);
+            h.end_frame();
+        }
+        h.reset();
+        let after: Vec<f32> = hum(SR * 7)[SR * 6 + 123..].to_vec();
+        let y: Vec<f32> = after.iter().map(|&s| { let o = h.tick(0, s); h.end_frame(); o }).collect();
+        let w = SR * 3 / 10; // first 0.3 s after the seek
+        let left: f64 = y[..w].iter().map(|a| (*a as f64).powi(2)).sum();
+        let had: f64 = after[..w].iter().map(|a| (*a as f64).powi(2)).sum();
+        let red = db(had) - db(left);
+        println!("hum in the first 0.3 s after seek reduced by {red:.1} dB");
+        // 3 Hz notches from a cleared state manage ~7.6 dB here; the wide start doubles that.
+        assert!(red > 13.0, "only {red:.1} dB in the first 0.3 s after seek");
+    }
+
+    #[test]
+    fn hum_back_right_after_near_silent_pause() {
+        // Learn the hum, then ~1 s of -85 dBFS noise (fade/dither while paused), then play again.
+        let mut h = Hum::new(SR);
+        h.set(50.0);
+        for &s in &hum(SR * 6) {
+            h.tick(0, s);
+            h.end_frame();
+        }
+        let mut seed = 7u32;
+        for _ in 0..SR {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let n = ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0e-4;
+            h.tick(0, n);
+            h.end_frame();
+        }
+        h.reset();
+        let after: Vec<f32> = hum(SR * 8)[SR * 7..].to_vec();
+        let y: Vec<f32> = after.iter().map(|&s| { let o = h.tick(0, s); h.end_frame(); o }).collect();
+        let w = SR * 3 / 10;
+        let left: f64 = y[..w].iter().map(|a| (*a as f64).powi(2)).sum();
+        let had: f64 = after[..w].iter().map(|a| (*a as f64).powi(2)).sum();
+        let red = db(had) - db(left);
+        println!("hum after near-silent pause reduced by {red:.1} dB in the first 0.3 s");
+        assert!(red > 13.0, "only {red:.1} dB after a near-silent pause");
+    }
+
+    #[test]
+    fn hum_change_followed_fast() {
+        // Weak hum on harmonics 1..3 over room noise, then it suddenly gets 10 dB louder with
+        // harmonics 1..10 (another device switched on). New notches must engage within ~1 s.
+        // (No voice here: it would mask the measurement; voice safety is tested above.)
+        let v = vec![0.0f32; SR * 12];
+        let mut seed = 3u32;
+        let x: Vec<f32> = (0..v.len())
+            .map(|i| {
+                let t = i as f64 / SR as f64;
+                let (amp, kmax) = if t < 6.0 { (0.003, 3) } else { (0.01, 10) };
+                let hm: f64 = (1..=kmax).map(|k| (2.0 * std::f64::consts::PI * 50.0 * k as f64 * t + k as f64).sin() * amp / k as f64).sum();
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let n = ((seed >> 8) as f64 / (1u32 << 24) as f64 - 0.5) * 2e-3;
+                v[i] + (hm + n) as f32
+            })
+            .collect();
+        let y = run(&x);
+        // Residual hum on harmonics 4..10 (absent before the change) between +1.0 and +3.0 s.
+        let (a, b) = (SR * 7, SR * 9);
+        let tone = |sig: &[f32], f: f64| {
+            let (mut re, mut im) = (0.0, 0.0);
+            for (i, &s) in sig.iter().enumerate() {
+                let p = 2.0 * std::f64::consts::PI * f * (a + i) as f64 / SR as f64;
+                re += s as f64 * p.cos();
+                im += s as f64 * p.sin();
+            }
+            (re * re + im * im).sqrt()
+        };
+        let mut worst = f64::INFINITY;
+        for k in 4..=10 {
+            let f = 50.0 * k as f64;
+            // Hum left = output minus the clean voice (the filter leaves voice alone, see above).
+            let hum_only: Vec<f32> = (a..b).map(|i| x[i] - v[i]).collect();
+            let left: Vec<f32> = (a..b).map(|i| y[i] - v[i]).collect();
+            let r = 20.0 * (tone(&hum_only, f) / tone(&left, f)).log10();
+            println!("  {f} Hz: reduced {r:.1} dB");
+            worst = worst.min(r);
+        }
+        println!("new hum harmonics 1-3 s after the change: worst reduction {worst:.1} dB");
+        assert!(worst > 15.0, "new hum harmonics reduced only {worst:.1} dB");
+    }
+
     /// Prints numbers for real recordings when they are around (test_out is gitignored).
     #[test]
     fn real_files_report() {
@@ -599,5 +782,39 @@ mod tests {
                 w.finalize().unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod scenario {
+    use super::Hum;
+    fn tone50(y: &[f32]) -> f64 {
+        let n = y.len();
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, &v) in y.iter().enumerate() {
+            let p = 2.0 * std::f64::consts::PI * 50.03 * i as f64 / 48000.0;
+            re += v as f64 * p.cos();
+            im += v as f64 * p.sin();
+        }
+        20.0 * ((re * re + im * im).sqrt() * 2.0 / n as f64 + 1e-12).log10()
+    }
+    #[test]
+    fn premiere_play_silence_play() {
+        let Ok(mut r) = hound::WavReader::open("test_out/final1_hum.wav") else { return };
+        let x: Vec<f32> = r.samples::<f32>().map(Result::unwrap).collect();
+        let sr = 48000;
+        let mut h = Hum::new(sr);
+        h.set(50.0);
+        let mut play = |h: &mut Hum, seg: &[f32], label: &str| {
+            h.reset();
+            let y: Vec<f32> = seg.iter().map(|&s| { let o = h.tick(0, s); h.end_frame(); o }).collect();
+            let per: Vec<String> = y[..sr / 2].chunks(sr / 20).map(|c| format!("{:.0}", tone50(c))).collect();
+            println!("{label}: in {:.0} dB, out per 50 ms (first 0.5 s): {}", tone50(seg), per.join(" "));
+            println!("   g: {:?}", h.g.iter().take(6).map(|g| (g * 100.0).round() as i32).collect::<Vec<_>>());
+        };
+        play(&mut h, &x[0..sr * 6], "play from start 6 s");
+        play(&mut h, &vec![0.0; sr * 5], "gap (silence) 5 s");
+        play(&mut h, &x[sr * 3..sr * 7], "play again at 3 s");
+        play(&mut h, &x[sr * 1..sr * 5], "seek to 1 s");
     }
 }

@@ -4,7 +4,7 @@ exclude = ["vendor"]
 
 [package]
 name = "clean_voice"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "DeepFilterNet3 voice denoiser (VST3/CLAP)"
